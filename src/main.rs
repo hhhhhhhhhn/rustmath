@@ -1,6 +1,10 @@
 use std::ops;
 use std::cmp;
 
+#[derive(Debug)]
+pub enum MathError {
+    NotFound
+}
 
 pub trait Numeric: Sized + ops::Add<Self, Output=Self> + ops::Sub<Self, Output=Self> + ops::Mul<Self, Output=Self> + ops::Div<Self, Output = Self> + ops::Neg<Output = Self> + cmp::PartialEq + cmp::PartialOrd + Clone {
     fn abs(self) -> Self;
@@ -32,14 +36,14 @@ impl Numeric for f64 {
     }
 }
 
-fn derivative<N: Numeric>(f: &impl Fn(N)->N, x0: N) -> N {
+pub fn derivative<N: Numeric>(f: &impl Fn(N)->N, x0: N) -> N {
     return (
         f(x0.clone() + N::fromfloat(0.5)*N::epsilon())
         - f(x0 - N::fromfloat(0.5)*N::epsilon()))
             /N::epsilon()
 }
 
-fn integral<N: Numeric>(f: &impl Fn(N)->N, x0: N, x1: N, steps: i32) -> N {
+pub fn integral<N: Numeric>(f: &impl Fn(N)->N, x0: N, x1: N, steps: i32) -> N {
     let mut changesign = false;
     let (mut x0, x1) = if x0 > x1 {
         changesign = true;
@@ -62,18 +66,18 @@ fn integral<N: Numeric>(f: &impl Fn(N)->N, x0: N, x1: N, steps: i32) -> N {
     }
 }
 
-fn newtons_method<N: Numeric>(f: &impl Fn(N)->N, mut x0: N, maxiter: i32) -> Option<N> {
+pub fn newtons_method<N: Numeric>(f: &impl Fn(N)->N, mut x0: N, maxiter: i32) -> Result<N, MathError> {
     for _ in 0..maxiter {
         let fx0 = f(x0.clone());
         if fx0.clone().abs() < N::precision() {
-            return Some(x0)
+            return Ok(x0)
         }
         x0 = x0.clone() - fx0/derivative(f, x0)
     }
-    return None
+    return Err(MathError::NotFound)
 }
 
-fn factorial(n: usize) -> usize {
+pub fn factorial(n: usize) -> usize {
     let mut accum = 1;
     for i in 1..=n {
         accum *= i
@@ -81,7 +85,7 @@ fn factorial(n: usize) -> usize {
     return accum
 }
 
-fn power<N: Numeric>(x: N, power: usize) -> N {
+pub fn power<N: Numeric>(x: N, power: usize) -> N {
     let mut accum = N::fromfloat(1.);
     for _ in 0..power {
         accum = accum * x.clone();
@@ -89,24 +93,114 @@ fn power<N: Numeric>(x: N, power: usize) -> N {
     return accum
 }
 
-fn solve_ode<N: Numeric, const ORDER: usize>(ode: &impl Fn(N, [N; ORDER]) -> N, t0: N, mut x0: [N; ORDER], maxsolveiters: i32, step_size: N) -> Option<(N, [N; ORDER])> {
-    let last_derivative = newtons_method(&|x| {
-        let mut x1 = x0.clone();
-        x1[ORDER-1] = x;
-        return ode(t0.clone(), x1)
-    }, x0[ORDER-1].clone(), maxsolveiters)?;
-    x0[ORDER-1] = last_derivative;
+pub struct ODESolver<'a, N: Numeric, F: Fn(N, [N; ORDER])->N, const ORDER: usize> {
+    ode: &'a F,
+    // NOTE: In both entries, the last derivative isn't the actual last derivative
+    // it's the last t value's last derivative, which is an ok starting point
+    // for actually finding the derivative using Newton's Method,
+    // which is done when computing the *next* value.
+    // The entries could be actually ORDER-1 in length,
+    // (as so could be x0), but this prevents copying,
+    // and allows users to put an initial guess for finding the last derivative.
+    right_entries: Vec<[N; ORDER]>,
+    left_entries: Vec<[N; ORDER]>,
+    max_solve_iters: i32,
+    t0: N,
+    step_size: N,
+}
 
-    // Taylor series, beggining from lowest to highest term
-    // We don't do the last one, as it will be solved using Netwon's method anyways
-    for current_order in 0..(ORDER-1) {
-        for other_order in (current_order+1)..ORDER {
-            let n = other_order - current_order;
-            let nfactorial = factorial(n);
-            x0[current_order] = x0[current_order].clone() + x0[other_order].clone()*power(step_size.clone(), n)/N::fromfloat(nfactorial as f64)
+impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a, N, F, ORDER> {
+    pub fn new(ode: &'a F, t0: N, x0: [N; ORDER], step_size: N, max_solve_iters: i32) -> Self {
+        let result = Self{
+            ode,
+            t0,
+            step_size,
+            max_solve_iters,
+            left_entries: vec![x0.clone()],
+            right_entries: vec![x0]
+        };
+        return result
+    }
+    pub fn advance_right(&mut self) -> Result<(), MathError> {
+        let mut current_x = self.right_entries.last().expect("Entries always non-empty").clone();
+        let current_t = self.current_maximum_t();
+        let last_derivative = newtons_method(&|last_derivative| {
+            let mut changed_x = current_x.clone();
+            changed_x[ORDER-1] = last_derivative;
+            return (self.ode)(current_t.clone(), changed_x)
+        }, current_x[ORDER-1].clone(), self.max_solve_iters)?;
+        current_x[ORDER-1] = last_derivative;
+
+        let mut next_x = current_x;
+        // Taylor series, beggining from lowest to highest term
+        // We don't do the last one, as it will be solved using Netwon's method anyways
+        for current_order in 0..(ORDER-1) {
+            for other_order in (current_order+1)..ORDER {
+                let n = other_order - current_order;
+                let nfactorial = factorial(n);
+                next_x[current_order] = next_x[current_order].clone() + next_x[other_order].clone()*power(self.step_size.clone(), n)/N::fromfloat(nfactorial as f64)
+            }
+        }
+        self.right_entries.push(next_x.clone());
+        return Ok(())
+    }
+    pub fn advance_left(&mut self) -> Result<(), MathError> {
+        let mut current_x = self.left_entries.last().expect("Entries always non-empty").clone();
+        let current_t = self.current_mininum_t();
+        let last_derivative = newtons_method(&|last_derivative| {
+            let mut changed_x = current_x.clone();
+            changed_x[ORDER-1] = last_derivative;
+            return (self.ode)(current_t.clone(), changed_x)
+        }, current_x[ORDER-1].clone(), self.max_solve_iters)?;
+        current_x[ORDER-1] = last_derivative;
+
+        let mut next_x = current_x;
+        // Taylor series, beggining from lowest to highest term
+        // We don't do the last one, as it will be solved using Netwon's method anyways
+        for current_order in 0..(ORDER-1) {
+            for other_order in (current_order+1)..ORDER {
+                let n = other_order - current_order;
+                let nfactorial = factorial(n);
+                next_x[current_order] = next_x[current_order].clone() + next_x[other_order].clone()*power(-self.step_size.clone(), n)/N::fromfloat(nfactorial as f64)
+            }
+        }
+        self.left_entries.push(next_x.clone());
+        return Ok(())
+    }
+
+    fn current_maximum_t(&self) -> N {
+        return self.t0.clone() + self.step_size.clone()*N::fromfloat((self.right_entries.len() - 1) as f64);
+    }
+
+    fn current_mininum_t(&self) -> N {
+        return self.t0.clone() - self.step_size.clone()*N::fromfloat((self.left_entries.len() - 1) as f64);
+    }
+
+    pub fn evaluate(&mut self, t: N) -> Result<N, MathError> {
+        while t < self.current_mininum_t() {
+            self.advance_left()?;
+        }
+        while t > self.current_maximum_t() {
+            self.advance_right()?;
+        }
+        // TODO: Interpolate between two sorrounding values
+        if t > self.t0 {
+            let distance = t - self.t0.clone();
+            let mut index = N::tofloat(distance.clone()/self.step_size.clone()) as usize;
+            println!("Distance {}, index {}", N::tofloat(distance), index);
+            if index >= self.right_entries.len() {
+                index = self.right_entries.len()-1
+            }
+            return Ok(self.right_entries[index][0].clone())
+        } else {
+            let distance = self.t0.clone() - t;
+            let mut index = N::tofloat(distance/self.step_size.clone()) as usize;
+            if index >= self.left_entries.len() {
+                index = self.left_entries.len()-1
+            }
+            return Ok(self.left_entries[index][0].clone())
         }
     }
-    return Some((t0 + step_size, x0))
 }
 
 fn main() {
@@ -117,17 +211,16 @@ fn main() {
     println!("{}", derivative(&|x| x*x, 2.0));
     println!("{}", newtons_method(&|x: f64| x.sin() - 1., 0.0, 10000).unwrap()*2.);
 
-    let mut x0 = [1.0, 0.0, -1.0];     // The last one doesn't matter, the first two are enough
+    let x0 = [1.0, 0.0, -1.0];     // The last one doesn't matter, the first two are enough
                                        // information
-    let mut t0 = 0.0;
-    let mut max = 0.0;
-    for _ in 0..100000 {
-        // i.e. x'' + x = 0, x(0) = 1, x'(0) = 0, equation with x = cos(t) as a solution
-        (t0, x0) = solve_ode(&|_t: f64, x: [f64;3]| x[2] + x[0] , t0, x0.clone(), 100, 0.00001).unwrap();
-        println!("{:?}: {:?}", t0, x0);
-        if x0[0] > max {
-            max = x0[0]
-        }
-    }
-    println!("{}", max);
+    let t0 = 0.0;
+    let ode = |_t: f64, x: [f64;3]| x[2] + x[0];
+    let mut solver = ODESolver::new(&ode, t0, x0, 0.00001, 100);
+    println!("{:?} {}", solver.evaluate(-2.).unwrap(), (-2.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(-1.).unwrap(), (-1.0_f64).cos());
+    println!("{:?} {}", solver.evaluate( 0.).unwrap(), ( 0.0_f64).cos());
+    println!("{:?} {}", solver.evaluate( 1.).unwrap(), ( 1.0_f64).cos());
+    println!("{:?} {}", solver.evaluate( 2.).unwrap(), ( 2.0_f64).cos());
+    println!("{:?} {}", solver.evaluate( 1.).unwrap(), ( 1.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(99.).unwrap(), (99.0_f64).cos());
 }
