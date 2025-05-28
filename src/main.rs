@@ -6,6 +6,8 @@ pub enum MathError {
     NotFound
 }
 
+const PREC: u32 = 200;
+
 pub trait Numeric: Sized + ops::Add<Self, Output=Self> + ops::Sub<Self, Output=Self> + ops::Mul<Self, Output=Self> + ops::Div<Self, Output = Self> + ops::Neg<Output = Self> + cmp::PartialEq + cmp::PartialOrd + Clone {
     fn abs(self) -> Self;
     fn epsilon() -> Self; // For derivatives and such
@@ -33,6 +35,28 @@ impl Numeric for f64 {
 
     fn precision() -> f64 {
         return 1e-10
+    }
+}
+
+impl Numeric for rug::Float {
+    fn abs(self) -> Self {
+        return self.abs()
+    }
+
+    fn epsilon() -> Self {
+        return rug::Float::with_val(PREC, rug::Float::parse("1e-50").unwrap());
+    }
+
+    fn tofloat(x: Self) -> f64 {
+        return x.to_f64()
+    }
+
+    fn fromfloat(x: f64) -> Self {
+        return rug::Float::with_val(PREC, x)
+    }
+
+    fn precision() -> Self {
+        return rug::Float::with_val(PREC, rug::Float::parse("1e-20").unwrap());
     }
 }
 
@@ -106,18 +130,24 @@ pub struct ODESolver<'a, N: Numeric, F: Fn(N, [N; ORDER])->N, const ORDER: usize
     left_entries: Vec<[N; ORDER]>,
     max_solve_iters: i32,
     t0: N,
+    x0: [N; ORDER],
     step_size: N,
+    memo: bool,
+    last_t_for_nomemo: N
 }
 
 impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a, N, F, ORDER> {
-    pub fn new(ode: &'a F, t0: N, x0: [N; ORDER], step_size: N, max_solve_iters: i32) -> Self {
+    pub fn new(ode: &'a F, t0: N, x0: [N; ORDER], step_size: N, max_solve_iters: i32, memo: bool) -> Self {
         let result = Self{
             ode,
-            t0,
+            t0: t0.clone(),
+            x0: x0.clone(),
             step_size,
             max_solve_iters,
             left_entries: vec![x0.clone()],
-            right_entries: vec![x0]
+            right_entries: vec![x0],
+            memo,
+            last_t_for_nomemo: t0,
         };
         return result
     }
@@ -141,12 +171,17 @@ impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a
                 next_x[current_order] = next_x[current_order].clone() + next_x[other_order].clone()*power(self.step_size.clone(), n)/N::fromfloat(nfactorial as f64)
             }
         }
-        self.right_entries.push(next_x.clone());
+        if self.memo {
+            self.right_entries.push(next_x.clone());
+        } else {
+            *self.right_entries.last_mut().expect("Entries always non-empty") = next_x.clone();
+            self.last_t_for_nomemo = self.last_t_for_nomemo.clone() + self.step_size.clone();
+        }
         return Ok(())
     }
     pub fn advance_left(&mut self) -> Result<(), MathError> {
         let mut current_x = self.left_entries.last().expect("Entries always non-empty").clone();
-        let current_t = self.current_mininum_t();
+        let current_t = self.current_minimum_t();
         let last_derivative = newtons_method(&|last_derivative| {
             let mut changed_x = current_x.clone();
             changed_x[ORDER-1] = last_derivative;
@@ -164,20 +199,36 @@ impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a
                 next_x[current_order] = next_x[current_order].clone() + next_x[other_order].clone()*power(-self.step_size.clone(), n)/N::fromfloat(nfactorial as f64)
             }
         }
-        self.left_entries.push(next_x.clone());
+        if self.memo {
+            self.left_entries.push(next_x.clone());
+        } else {
+            *self.left_entries.last_mut().expect("Entries always non-empty") = next_x.clone();
+            self.last_t_for_nomemo = self.last_t_for_nomemo.clone() - self.step_size.clone();
+        }
         return Ok(())
     }
 
     fn current_maximum_t(&self) -> N {
-        return self.t0.clone() + self.step_size.clone()*N::fromfloat((self.right_entries.len() - 1) as f64);
+        if self.memo {
+            return self.t0.clone() + self.step_size.clone()*N::fromfloat((self.right_entries.len() - 1) as f64);
+        } else {
+            return self.last_t_for_nomemo.clone()
+        }
     }
 
-    fn current_mininum_t(&self) -> N {
-        return self.t0.clone() - self.step_size.clone()*N::fromfloat((self.left_entries.len() - 1) as f64);
+    fn current_minimum_t(&self) -> N {
+        if self.memo {
+            return self.t0.clone() - self.step_size.clone()*N::fromfloat((self.left_entries.len() - 1) as f64);
+        } else {
+            return self.last_t_for_nomemo.clone()
+        }
     }
 
     pub fn evaluate(&mut self, t: N) -> Result<N, MathError> {
-        while t < self.current_mininum_t() {
+        self.last_t_for_nomemo = self.t0.clone();
+        self.right_entries = vec![self.x0.clone()];
+        self.left_entries = vec![self.x0.clone()];
+        while t < self.current_minimum_t() {
             self.advance_left()?;
         }
         while t > self.current_maximum_t() {
@@ -187,7 +238,6 @@ impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a
         if t > self.t0 {
             let distance = t - self.t0.clone();
             let mut index = N::tofloat(distance.clone()/self.step_size.clone()) as usize;
-            println!("Distance {}, index {}", N::tofloat(distance), index);
             if index >= self.right_entries.len() {
                 index = self.right_entries.len()-1
             }
@@ -201,6 +251,20 @@ impl<'a, N: Numeric, F: Fn(N, [N; ORDER]) -> N, const ORDER: usize> ODESolver<'a
             return Ok(self.left_entries[index][0].clone())
         }
     }
+
+    pub fn evaluate_from_scratch(&mut self, t: N) -> Result<N, MathError> {
+        if t > self.t0 {
+            while t > self.t0 {
+                self.advance_right()?
+            }
+            return Ok(self.right_entries[0][0].clone())
+        } else {
+            while t < self.t0 {
+                self.advance_left()?
+            }
+            return Ok(self.left_entries[0][0].clone())
+        }
+    }
 }
 
 fn main() {
@@ -210,17 +274,33 @@ fn main() {
 
     println!("{}", derivative(&|x| x*x, 2.0));
     println!("{}", newtons_method(&|x: f64| x.sin() - 1., 0.0, 10000).unwrap()*2.);
+    const STEP: f64 = 0.0000001;
 
     let x0 = [1.0, 0.0, -1.0];     // The last one doesn't matter, the first two are enough
-                                       // information
+                                   // information
     let t0 = 0.0;
     let ode = |_t: f64, x: [f64;3]| x[2] + x[0];
-    let mut solver = ODESolver::new(&ode, t0, x0, 0.00001, 100);
+    let mut solver = ODESolver::new(&ode, t0, x0, STEP, 100, false);
+    println!();
+    println!("f64");
     println!("{:?} {}", solver.evaluate(-2.).unwrap(), (-2.0_f64).cos());
     println!("{:?} {}", solver.evaluate(-1.).unwrap(), (-1.0_f64).cos());
     println!("{:?} {}", solver.evaluate( 0.).unwrap(), ( 0.0_f64).cos());
     println!("{:?} {}", solver.evaluate( 1.).unwrap(), ( 1.0_f64).cos());
     println!("{:?} {}", solver.evaluate( 2.).unwrap(), ( 2.0_f64).cos());
     println!("{:?} {}", solver.evaluate( 1.).unwrap(), ( 1.0_f64).cos());
-    println!("{:?} {}", solver.evaluate(99.).unwrap(), (99.0_f64).cos());
+
+    let x0 = [1.0, 0.0, -1.0].map(|x| rug::Float::with_val(PREC, x));     // The last one doesn't matter, the first two are enough
+    let t0 = rug::Float::with_val(PREC, rug::Float::parse("0.0").unwrap());
+    let ode = |_t: rug::Float, x: [rug::Float;3]| {let [x0,_x1,x2] = x; return x2 + x0};
+    let mut solver = ODESolver::new(&ode, t0, x0, rug::Float::with_val(PREC, STEP*1000.), 1000, false);
+
+    println!();
+    println!("rug Float");
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC, -2.)).unwrap().to_f64(), (-2.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC, -1.)).unwrap().to_f64(), (-1.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC,  0.)).unwrap().to_f64(), ( 0.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC,  1.)).unwrap().to_f64(), ( 1.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC,  2.)).unwrap().to_f64(), ( 2.0_f64).cos());
+    println!("{:?} {}", solver.evaluate(rug::Float::with_val(PREC,  1.)).unwrap().to_f64(), ( 1.0_f64).cos());
 }
